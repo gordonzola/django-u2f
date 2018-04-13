@@ -18,6 +18,7 @@ from django.shortcuts import resolve_url, get_object_or_404
 from django.contrib.sites.shortcuts import get_current_site
 from django.utils.functional import cached_property
 from django.utils.translation import ugettext as _
+from django.utils import timezone
 
 import qrcode
 from qrcode.image.svg import SvgPathImage
@@ -25,6 +26,7 @@ from u2flib_server import u2f
 
 from .forms import KeyResponseForm, BackupCodeForm, TOTPForm, KeyRegistrationForm
 from .models import TOTPDevice
+from . import default_settings
 
 
 class U2FLoginView(LoginView):
@@ -103,15 +105,25 @@ class AddKeyView(OriginMixin, FormView):
         request = u2f.begin_registration(self.get_origin(), [
             key.to_json() for key in self.request.user.u2f_keys.all()
         ])
-        self.request.session['u2f_registration_request'] = request
+        registration_request_timeout = timezone.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.request.session['u2f_registration_request'] = (request, registration_request_timeout)
         kwargs['registration_request'] = request
 
         return kwargs
 
     def form_valid(self, form):
         response = form.cleaned_data['response']
-        request = self.request.session['u2f_registration_request']
+        request, registration_time = self.request.session['u2f_registration_request']
+        now = timezone.now()
+        request_timeout = now.tzinfo.localize(
+            timezone.datetime.strptime(registration_time, '%Y-%m-%d %H:%M:%S') +
+            timezone.timedelta(seconds=default_settings.U2F_CHALLENGE_EXPIRATION)
+        )
         del self.request.session['u2f_registration_request']
+        if now > request_timeout:
+            form.add_error('__all__',
+                           'U2F challenge have expired. Please try again')
+            return super(AddKeyView, self).form_invalid(form)
         device, attestation_cert = u2f.complete_registration(request, response)
         self.request.user.u2f_keys.create(
             public_key=device['publicKey'],

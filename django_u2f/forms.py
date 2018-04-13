@@ -6,6 +6,8 @@ from django.utils.translation import ugettext_lazy as _
 
 from u2flib_server import u2f
 
+from . import default_settings
+
 
 class SecondFactorForm(forms.Form):
     def __init__(self, *args, **kwargs):
@@ -21,16 +23,27 @@ class KeyResponseForm(SecondFactorForm):
     def __init__(self, *args, **kwargs):
         super(KeyResponseForm, self).__init__(*args, **kwargs)
         if self.data:
-            self.sign_request = self.request.session['u2f_sign_request']
+            self.sign_request, self.sign_request_time = self.request.session['u2f_sign_request']
         else:
             self.sign_request = u2f.begin_authentication(self.appId, [
-                d.to_json() for d in self.user.u2f_keys.all()
+                    d.to_json() for d in self.user.u2f_keys.all()
             ])
-            self.request.session['u2f_sign_request'] = self.sign_request
+            self.sign_request_time = timezone.now().strftime('%Y-%m-%d %H:%M:%S')
+            self.request.session['u2f_sign_request'] = (self.sign_request, self.sign_request_time)
 
     def validate_second_factor(self):
         response = json.loads(self.cleaned_data['response'])
         try:
+            now = timezone.now()
+            request_timeout = now.tzinfo.localize(
+                timezone.datetime.strptime(self.sign_request_time, '%Y-%m-%d %H:%M:%S') +
+                timezone.timedelta(seconds=default_settings.U2F_CHALLENGE_EXPIRATION)
+            )
+            if now > request_timeout:
+                self.add_error('__all__',
+                               'U2F challenge have expired. Please try again')
+                del self.request.session['u2f_sign_request']
+                return False
             device, login_counter, _ = u2f.complete_authentication(self.sign_request, response)
             # TODO: store login_counter and verify it's increasing
             device = self.user.u2f_keys.get(key_handle=device['keyHandle'])
